@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: FinStack AI - Equity Research Copilot (Lambda + API Gateway + DynamoDB + S3 + OpenSearch Serverless + Amplify)
+
+Parameters:
+  AmplifyRepo:
+    Type: String
+    Default: https://github.com/Mridul2810/finstack-ai
+    Description: GitHub repo URL for the Amplify frontend (replace OWNER).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 1024
+    Environment:
+      Variables:
+        AWS_REGION: !Ref AWS::Region
+
+Resources:
+  # ---- API ----
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: lambda_api.lambda_handler
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref RawFilingsBucket
+          OPENSEARCH_COLLECTION: !GetAtt FilingsCollection.Id
+          CHAT_HISTORY_TABLE: !Ref ChatHistoryTable
+          FILING_META_TABLE: !Ref FilingMetaTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatHistoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FilingMetaTable
+        - S3CrudPolicy:
+            BucketName: !Ref RawFilingsBucket
+      Events:
+        AskApi:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+  # ---- Ingestion (S3 upload trigger) ----
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: lambda_ingest.lambda_handler
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref RawFilingsBucket
+          OPENSEARCH_COLLECTION: !GetAtt FilingsCollection.Id
+          FILING_META_TABLE: !Ref FilingMetaTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FilingMetaTable
+        - S3CrudPolicy:
+            BucketName: !Ref RawFilingsBucket
+      Events:
+        FilingUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawFilingsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+
+  # ---- Storage ----
+  RawFilingsBucket:
+    Type: AWS::S3::Bucket
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: ts
+          AttributeType: N
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: ts
+          KeyType: RANGE
+
+  FilingMetaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticker
+          AttributeType: S
+        - AttributeName: filing_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticker
+          KeyType: HASH
+        - AttributeName: filing_date
+          KeyType: RANGE
+
+  # ---- OpenSearch Serverless ----
+  FilingsCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: finstack-filings
+      Type: VECTORSEARCH
+
+  CollectionSecurityPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: finstack-network
+      Type: network
+      Policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/finstack-filings"]}],"AllowFromPublic":true}]'
+
+  CollectionAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: finstack-access
+      Type: data
+      Policy: '[{"Rules":[{"ResourceType":"index","Resource":["index/finstack-filings/filings"],"Permission":["aoss:CreateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument","aoss:UpdateIndex","aoss:DeleteIndex"]}],"Principal":["PLACEHOLDER-LAMBDA-ROLE-ARN"],"Description":"Lambda access"}]'
+
+  # ---- Frontend hosting ----
+  FrontendApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: finstack-ai-frontend
+      Repository: !Ref AmplifyRepo
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - cd frontend && npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: frontend/.next
+            files:
+              - '**/*'
+
+  # ---- Logs ----
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 30
+
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${IngestFunction}
+      RetentionInDays: 30
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  FrontendAppId:
+    Value: !Ref FrontendApp
